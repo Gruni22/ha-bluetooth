@@ -1,0 +1,7 @@
+generate_pairing_pin:
+  name: Generate Pairing PIN
+  description: >
+    Generates a one-time 6-digit pairing PIN valid for 10 minutes.
+    The PIN appears as a Home Assistant notification. Enter it in the
+    Home Assistant Bluetooth app during device setup to authenticate without WiFi.
+  fields: {}

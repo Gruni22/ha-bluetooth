@@ -1,0 +1,123 @@
+"""The Bluetooth API integration for Home Assistant.
+
+Exposes HA state/service APIs to the btdashboard Android app via BLE using a
+passcode-secured packet protocol.
+
+Architecture:
+  btdashboard ←(BLE)→ ESP32-S3 ←(USB-Serial)→ UsbSerialServer ←→ HA internal Python APIs
+"""
+
+from __future__ import annotations
+
+import logging
+
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.core import HomeAssistant
+
+from .api import BluetoothApiConfigView, BluetoothApiSetupQrView, BluetoothApiStatusView
+from .const import (
+    ADAPTER_MODE_ESP32,
+    ADAPTER_MODE_NATIVE,
+    CONF_ADAPTER_MODE,
+    CONF_DEVICE_NAME,
+    CONF_DEVICE_NAME_DEFAULT,
+    CONF_PASSCODE,
+    CONF_USB_PORT,
+    CONF_USB_PORT_DEFAULT,
+    DOMAIN,
+)
+
+PLATFORMS: list[str] = ["button"]
+
+_LOGGER = logging.getLogger(__name__)
+
+type BluetoothApiConfigEntry = ConfigEntry  # noqa: PYI042
+
+
+async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """One-shot migration: legacy entries (created before adapter_mode existed)
+    are factually all ESP32-via-USB, so set the field explicitly. No guessing —
+    every legacy entry was created when ESP32 was the only supported mode.
+    """
+    if CONF_ADAPTER_MODE not in entry.data:
+        new = {**entry.data, CONF_ADAPTER_MODE: ADAPTER_MODE_ESP32}
+        hass.config_entries.async_update_entry(entry, data=new)
+        _LOGGER.info("Migrated entry %s: set adapter_mode=esp32", entry.entry_id)
+    return True
+
+
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Set up Bluetooth API from a config entry."""
+    hass.data.setdefault(DOMAIN, {})
+
+    adapter_mode: str = entry.data[CONF_ADAPTER_MODE]
+    passcode: int = entry.data.get(CONF_PASSCODE, 0)
+    usb_port: str = entry.data.get(CONF_USB_PORT, CONF_USB_PORT_DEFAULT)
+
+    if adapter_mode == ADAPTER_MODE_NATIVE:
+        _LOGGER.error(
+            "Native Pi Bluetooth adapter mode is selected but not yet implemented. "
+            "Please re-configure the integration with ESP32 mode."
+        )
+        return False
+
+    from .usb_serial_server import UsbSerialServer
+
+    usb_server = UsbSerialServer(hass, port=usb_port, passcode=passcode)
+    try:
+        await usb_server.start()
+        _LOGGER.info("Bluetooth API USB Serial server started on %s", usb_port)
+    except Exception as exc:  # noqa: BLE001
+        _LOGGER.error("Failed to start USB Serial server on %s: %s", usb_port, exc)
+
+    hass.data[DOMAIN][entry.entry_id] = [usb_server]
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+    # Register HTTP endpoints (guard survives reloads)
+    if not hass.data[DOMAIN].get("views_registered"):
+        hass.http.register_view(BluetoothApiSetupQrView())
+        hass.http.register_view(BluetoothApiStatusView())
+        hass.http.register_view(BluetoothApiConfigView())
+        hass.data[DOMAIN]["views_registered"] = True
+
+    hass.async_create_task(_post_setup_notification(hass, entry))
+    entry.async_on_unload(entry.add_update_listener(_async_update_listener))
+    return True
+
+
+async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Stop the USB server and unload the config entry."""
+    await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    servers = hass.data.get(DOMAIN, {}).pop(entry.entry_id, [])
+    for server in servers:
+        try:
+            await server.stop()
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.debug("Error stopping server during unload: %s", exc)
+    return True
+
+
+async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    await hass.config_entries.async_reload(entry.entry_id)
+
+
+async def _post_setup_notification(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Create a persistent notification with the setup QR code."""
+    passcode: int = entry.data.get(CONF_PASSCODE, 0)
+    hex_str = f"{passcode:08X}"
+    display = f"{hex_str[:4]}-{hex_str[4:]}"
+    qr_url = f"/api/bluetooth_api/setup_qr/{entry.entry_id}"
+    device_name: str = entry.data.get(CONF_DEVICE_NAME, CONF_DEVICE_NAME_DEFAULT)
+    await hass.services.async_call(
+        "persistent_notification", "create",
+        {
+            "notification_id": f"bluetooth_api_setup_{entry.entry_id}",
+            "title": f"Bluetooth API: {device_name}",
+            "message": (
+                f"![QR Code]({qr_url})\n\n"
+                f"Scanne den QR-Code in der **btdashboard**-App, "
+                f"um die Verbindung einzurichten.\n\n"
+                f"Passcode (manuell): **{display}**"
+            ),
+        },
+    )
