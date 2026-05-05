@@ -3,8 +3,13 @@
 Exposes HA state/service APIs to the btdashboard Android app via BLE using a
 passcode-secured packet protocol.
 
+Three transport (adapter) modes:
+  esp32    — ESP32-S3 over USB-Serial (UsbSerialServer)
+  esphome  — ESPHome ble_server device over WiFi/native API (EsphomeApiServer)
+  native   — Pi's own Bluetooth (HaBleGattServer, planned)
+
 Architecture:
-  btdashboard ←(BLE)→ ESP32-S3 ←(USB-Serial)→ UsbSerialServer ←→ HA internal Python APIs
+  btdashboard ←(BLE)→ adapter device ←(USB / WiFi / direct)→ HA internal Python APIs
 """
 
 from __future__ import annotations
@@ -17,10 +22,14 @@ from homeassistant.core import HomeAssistant
 from .api import BluetoothApiConfigView, BluetoothApiSetupQrView, BluetoothApiStatusView
 from .const import (
     ADAPTER_MODE_ESP32,
+    ADAPTER_MODE_ESPHOME,
     ADAPTER_MODE_NATIVE,
     CONF_ADAPTER_MODE,
     CONF_DEVICE_NAME,
     CONF_DEVICE_NAME_DEFAULT,
+    CONF_ESPHOME_HOST,
+    CONF_ESPHOME_PORT,
+    CONF_ESPHOME_PORT_DEFAULT,
     CONF_PASSCODE,
     CONF_USB_PORT,
     CONF_USB_PORT_DEFAULT,
@@ -52,25 +61,42 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     adapter_mode: str = entry.data[CONF_ADAPTER_MODE]
     passcode: int = entry.data.get(CONF_PASSCODE, 0)
-    usb_port: str = entry.data.get(CONF_USB_PORT, CONF_USB_PORT_DEFAULT)
 
     if adapter_mode == ADAPTER_MODE_NATIVE:
         _LOGGER.error(
             "Native Pi Bluetooth adapter mode is selected but not yet implemented. "
-            "Please re-configure the integration with ESP32 mode."
+            "Please re-configure the integration with ESP32 or ESPHome mode."
         )
         return False
 
-    from .usb_serial_server import UsbSerialServer
+    if adapter_mode == ADAPTER_MODE_ESPHOME:
+        from .esphome_server import EsphomeApiServer
 
-    usb_server = UsbSerialServer(hass, port=usb_port, passcode=passcode)
-    try:
-        await usb_server.start()
-        _LOGGER.info("Bluetooth API USB Serial server started on %s", usb_port)
-    except Exception as exc:  # noqa: BLE001
-        _LOGGER.error("Failed to start USB Serial server on %s: %s", usb_port, exc)
+        host: str = entry.data.get(CONF_ESPHOME_HOST, "")
+        port: int = int(entry.data.get(CONF_ESPHOME_PORT, CONF_ESPHOME_PORT_DEFAULT))
+        if not host:
+            _LOGGER.error("ESPHome adapter mode selected but no host configured")
+            return False
+        server = EsphomeApiServer(hass, host=host, port=port, passcode=passcode)
+        try:
+            await server.start()
+            _LOGGER.info("Bluetooth API ESPHome bridge starting → %s:%d", host, port)
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.error("Failed to start ESPHome bridge to %s:%d: %s", host, port, exc)
+        hass.data[DOMAIN][entry.entry_id] = [server]
+    else:
+        # ADAPTER_MODE_ESP32
+        from .usb_serial_server import UsbSerialServer
 
-    hass.data[DOMAIN][entry.entry_id] = [usb_server]
+        usb_port: str = entry.data.get(CONF_USB_PORT, CONF_USB_PORT_DEFAULT)
+        usb_server = UsbSerialServer(hass, port=usb_port, passcode=passcode)
+        try:
+            await usb_server.start()
+            _LOGGER.info("Bluetooth API USB Serial server started on %s", usb_port)
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.error("Failed to start USB Serial server on %s: %s", usb_port, exc)
+        hass.data[DOMAIN][entry.entry_id] = [usb_server]
+
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
     # Register HTTP endpoints (guard survives reloads)
@@ -86,7 +112,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Stop the USB server and unload the config entry."""
+    """Stop the bridge server and unload the config entry."""
     await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     servers = hass.data.get(DOMAIN, {}).pop(entry.entry_id, [])
     for server in servers:

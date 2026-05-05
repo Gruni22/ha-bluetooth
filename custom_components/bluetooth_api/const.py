@@ -4,8 +4,9 @@ DOMAIN = "bluetooth_api"
 
 # Adapter mode
 CONF_ADAPTER_MODE = "adapter_mode"
-ADAPTER_MODE_NATIVE = "native"   # HA uses its own BT adapter (bless GATT server)
-ADAPTER_MODE_ESP32 = "esp32"     # HA communicates via ESP32 over USB-Serial
+ADAPTER_MODE_NATIVE = "native"     # HA uses its own BT adapter (bless GATT server)
+ADAPTER_MODE_ESP32 = "esp32"       # HA communicates via ESP32 over USB-Serial
+ADAPTER_MODE_ESPHOME = "esphome"   # HA communicates via an ESPHome ble_server device over WiFi (native API)
 
 # Native BT adapter identifier (e.g. "hci0" or MAC address)
 CONF_BT_ADAPTER = "bt_adapter"
@@ -13,6 +14,20 @@ CONF_BT_ADAPTER = "bt_adapter"
 # USB Serial (ESP32-S3 gateway, only used when adapter_mode == "esp32")
 CONF_USB_PORT = "usb_port"
 CONF_USB_PORT_DEFAULT = "/dev/ttyACM0"
+
+# ESPHome native API (only used when adapter_mode == "esphome")
+# NOTE: ESPHome 2026.1.0 removed legacy password authentication. Connecting to a
+# remote ble_server device only requires host/port; the API must be configured
+# without an `encryption_key:` (plaintext) — noise encryption is not supported
+# by this transport in v1.
+CONF_ESPHOME_HOST = "esphome_host"
+CONF_ESPHOME_PORT = "esphome_port"
+CONF_ESPHOME_PORT_DEFAULT = 6053
+
+# ble_server protobuf message IDs (must match esphome/components/api/api.proto)
+BLE_SERVER_SUBSCRIBE_REQUEST_ID = 149
+BLE_SERVER_FRAME_RESPONSE_ID = 150
+BLE_SERVER_SEND_FRAME_REQUEST_ID = 151
 
 # Passcode (32-bit uint, generated once during setup, included in every packet)
 CONF_PASSCODE = "passcode"

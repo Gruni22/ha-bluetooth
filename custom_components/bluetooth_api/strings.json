@@ -3,12 +3,42 @@
     "step": {
       "user": {
         "title": "Bluetooth API",
-        "description": "Connect your mobile app to Home Assistant via Bluetooth when no network is available.",
+        "description": "Connect your mobile app to Home Assistant via Bluetooth.",
         "data": {
-          "rfcomm_enabled": "Enable Classic Bluetooth (RFCOMM)",
-          "rfcomm_channel": "RFCOMM channel (1–30)",
-          "ble_enabled": "Enable BLE GATT (requires bless library)"
+          "adapter_mode": "Adapter",
+          "device_name": "BLE device name"
         }
+      },
+      "esp32": {
+        "title": "ESP32 USB-Serial gateway",
+        "description": "Pick the serial port of the connected ESP32-S3.",
+        "data": {
+          "usb_port": "USB port"
+        }
+      },
+      "esp32_manual": {
+        "title": "ESP32 USB-Serial gateway (manual)",
+        "data": {
+          "usb_port": "USB port (e.g. /dev/ttyACM0)"
+        }
+      },
+      "esphome": {
+        "title": "ESPHome ble_server device",
+        "description": "Pick an ESPHome device with the ble_server component enabled.",
+        "data": {
+          "esphome_host": "Device"
+        }
+      },
+      "esphome_manual": {
+        "title": "ESPHome ble_server device (manual)",
+        "data": {
+          "esphome_host": "Host or IP",
+          "esphome_port": "Native API port"
+        }
+      },
+      "confirm": {
+        "title": "Confirm setup",
+        "description": "{info}"
       }
     },
     "abort": {
