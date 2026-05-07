@@ -33,6 +33,17 @@ BLE_SERVER_SEND_FRAME_REQUEST_ID = 151
 # Passcode (32-bit uint, generated once during setup, included in every packet)
 CONF_PASSCODE = "passcode"
 
+# HA labels used as exposure filters: only entities (or their parent devices)
+# carrying these labels are pushed over the bluetooth_api transport. Drastically
+# reduces ANS_DEVICES payload size (no more shipping every Supervisor update
+# entity to the phone) and gives the user a clean way to choose which devices
+# show up in the app vs Android Auto. Labels are auto-created during setup if
+# they don't exist; the user assigns them via HA's UI like any other label.
+# The app additionally filters by user-named labels (e.g. DASH_Battery) for
+# its dashboard groupings.
+LABEL_BTDASH = "BTDASH"        # phone/tablet UI
+LABEL_BTDASHAA = "BTDASHAA"    # Android Auto
+
 # BLE device name advertised
 CONF_DEVICE_NAME = "device_name"
 CONF_DEVICE_NAME_DEFAULT = "Homeassistant_Home"

@@ -44,6 +44,8 @@ from .const import (
     CMD_REQ_DEVICES,
     CMD_REQ_STATE,
     CMD_STATE_CHANGE,
+    LABEL_BTDASH,
+    LABEL_BTDASHAA,
 )
 from .protocol import decode_packet, encode_packet_json
 
@@ -170,14 +172,35 @@ class PacketDispatcher:
         await self._send_packet(CMD_ANS_AREAS, areas)
 
     async def _handle_req_devices(self, area_id: str | None) -> None:
-        from homeassistant.helpers import entity_registry as er
+        from homeassistant.helpers import (
+            device_registry as dr,
+            entity_registry as er,
+            label_registry as lr,
+        )
         ent_registry = er.async_get(self._hass)
+        dev_registry = dr.async_get(self._hass)
+        label_registry = lr.async_get(self._hass)
+        exposure_ids = _exposure_label_ids(label_registry)
+        if not exposure_ids:
+            # BTDASH / BTDASHAA missing — integration setup didn't run yet, or
+            # the user deleted the labels. Either way, nothing to expose.
+            await self._send_packet(CMD_ANS_DEVICES, [])
+            return
+
+        # label_id → name map, built once for this response.
+        id_to_name = {l.label_id: l.name for l in label_registry.async_list_labels()}
+
         states = self._hass.states.async_all()
         entities = []
         slim_keys = _SLIM_ATTR_KEYS
         for state in states:
             entry = ent_registry.async_get(state.entity_id)
-            entity_area = getattr(entry, "area_id", None) if entry else None
+            if entry is None:
+                continue
+            label_ids = _entity_label_ids(entry, dev_registry)
+            if not (label_ids & exposure_ids):
+                continue
+            entity_area = entry.area_id
             if area_id is not None and entity_area != area_id:
                 continue
             attrs = state.attributes
@@ -190,6 +213,9 @@ class PacketDispatcher:
                 "area_id": entity_area,
                 "state": state.state,
                 "attrs": slim_attrs,
+                # Full label-name set so the app can do dashboard-level
+                # filtering (e.g. show DASH_Battery on the Battery view).
+                "labels": sorted(id_to_name[lid] for lid in label_ids if lid in id_to_name),
             })
         await self._send_packet(CMD_ANS_DEVICES, entities)
 
@@ -247,6 +273,11 @@ class PacketDispatcher:
         if state is None:
             await self._send_packet(CMD_NACK, {"error": f"entity '{entity_id}' not found"})
             return
+        # Honour the same exposure filter as ANS_DEVICES — an entity that's not
+        # in the dashboard list shouldn't leak its state via direct REQ_STATE.
+        if not _is_exposed(self._hass, entity_id):
+            await self._send_packet(CMD_NACK, {"error": f"entity '{entity_id}' not exposed"})
+            return
         await self._send_packet(CMD_ANS_STATE, _state_to_dict(state))
 
     async def _handle_call_service(self, payload: dict) -> None:
@@ -275,10 +306,18 @@ class PacketDispatcher:
         if self._state_unsub:
             return
 
+        hass = self._hass
+
         @callback
         def _on_state_changed(event: Any) -> None:
             new_state = event.data.get("new_state")
             if new_state is None:
+                return
+            # Only push state changes for entities the user explicitly exposed
+            # via BTDASH / BTDASHAA. Without this filter every Supervisor /
+            # update / sensor change would be sent over BLE — wasteful and
+            # noisy on the chunked notify path.
+            if not _is_exposed(hass, new_state.entity_id):
                 return
             asyncio.ensure_future(
                 self._send_packet(CMD_STATE_CHANGE, _state_to_dict(new_state))
@@ -315,6 +354,53 @@ def _state_to_dict(state: Any) -> dict:
         "attributes": dict(state.attributes),
         "last_changed": state.last_changed.isoformat() if state.last_changed else None,
     }
+
+
+def _exposure_label_ids(label_registry: Any) -> set[str]:
+    """Return the set of label_ids that mark an entity as exposed (BTDASH / BTDASHAA)."""
+    ids: set[str] = set()
+    for name in (LABEL_BTDASH, LABEL_BTDASHAA):
+        label = label_registry.async_get_label_by_name(name)
+        if label is not None:
+            ids.add(label.label_id)
+    return ids
+
+
+def _entity_label_ids(entry: Any, dev_registry: Any) -> set[str]:
+    """Return the union of an entity's own labels and its parent device's labels.
+
+    HA exposes labels at both the entity and the device level. For the
+    btdashboard filter we treat them as one set: labelling the device is the
+    common case (one click in the UI labels every entity it owns).
+    """
+    label_ids: set[str] = set(entry.labels)
+    if entry.device_id:
+        device = dev_registry.async_get(entry.device_id)
+        if device is not None:
+            label_ids |= set(device.labels)
+    return label_ids
+
+
+def _is_exposed(hass: HomeAssistant, entity_id: str) -> bool:
+    """Cheap per-event check used by state_changed and REQ_STATE.
+
+    Resolves the entity's effective label set on the fly. In the hot state-
+    change path this means three registry lookups per event — all O(1) dict
+    reads, so we don't bother caching across events.
+    """
+    from homeassistant.helpers import (
+        device_registry as dr,
+        entity_registry as er,
+        label_registry as lr,
+    )
+    ent_reg = er.async_get(hass)
+    entry = ent_reg.async_get(entity_id)
+    if entry is None:
+        return False
+    label_ids = _entity_label_ids(entry, dr.async_get(hass))
+    if not label_ids:
+        return False
+    return bool(label_ids & _exposure_label_ids(lr.async_get(hass)))
 
 
 def _extract_entity_ids(node: object) -> list[str]:

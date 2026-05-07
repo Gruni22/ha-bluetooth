@@ -35,6 +35,8 @@ from .const import (
     CONF_USB_PORT,
     CONF_USB_PORT_DEFAULT,
     DOMAIN,
+    LABEL_BTDASH,
+    LABEL_BTDASHAA,
 )
 
 PLATFORMS: list[str] = ["button"]
@@ -42,6 +44,25 @@ PLATFORMS: list[str] = ["button"]
 _LOGGER = logging.getLogger(__name__)
 
 type BluetoothApiConfigEntry = ConfigEntry  # noqa: PYI042
+
+
+def _ensure_btdash_labels(hass: HomeAssistant) -> None:
+    """Create BTDASH / BTDASHAA labels in HA's label registry if missing.
+
+    Idempotent — does nothing on subsequent setups. The user assigns these
+    labels to entities or devices via HA's UI to control what shows up in the
+    btdashboard app and Android Auto.
+    """
+    from homeassistant.helpers import label_registry as lr
+
+    reg = lr.async_get(hass)
+    for name in (LABEL_BTDASH, LABEL_BTDASHAA):
+        if reg.async_get_label_by_name(name) is None:
+            reg.async_create(name)
+            _LOGGER.info(
+                "Created HA label '%s' (used by bluetooth_api as exposure filter)",
+                name,
+            )
 
 
 async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -59,6 +80,8 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Bluetooth API from a config entry."""
     hass.data.setdefault(DOMAIN, {})
+
+    _ensure_btdash_labels(hass)
 
     adapter_mode: str = entry.data[CONF_ADAPTER_MODE]
     passcode: int = entry.data.get(CONF_PASSCODE, 0)
