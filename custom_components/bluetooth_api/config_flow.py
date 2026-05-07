@@ -19,6 +19,7 @@ from .const import (
     CONF_DEVICE_NAME,
     CONF_DEVICE_NAME_DEFAULT,
     CONF_ESPHOME_HOST,
+    CONF_ESPHOME_NOISE_PSK,
     CONF_ESPHOME_PORT,
     CONF_ESPHOME_PORT_DEFAULT,
     CONF_PASSCODE,
@@ -104,22 +105,24 @@ def _list_serial_ports() -> list[tuple[str, str, int]]:
     return results
 
 
-def _list_esphome_devices(hass: Any) -> list[tuple[str, int, str]]:
-    """Return [(host, port, label)] for ESPHome integrations already configured in HA.
+def _list_esphome_devices(hass: Any) -> list[tuple[str, int, str, str]]:
+    """Return [(host, port, label, noise_psk)] for ESPHome integrations already configured in HA.
 
     Lets the user pick an existing ESPHome device from a dropdown instead of
-    typing the host. Falls back to manual entry when no ESPHome integrations
-    are present.
+    typing the host. Also harvests the device's `noise_psk` so the user
+    doesn't have to paste their encryption key again. Falls back to manual
+    entry when no ESPHome integrations are present.
     """
-    out: list[tuple[str, int, str]] = []
+    out: list[tuple[str, int, str, str]] = []
     try:
         for entry in hass.config_entries.async_entries("esphome"):
             host = entry.data.get("host")
             port = entry.data.get("port", CONF_ESPHOME_PORT_DEFAULT)
+            noise_psk = entry.data.get("noise_psk", "") or ""
             if not host:
                 continue
             label = f"{entry.title} ({host}:{port})" if entry.title else f"{host}:{port}"
-            out.append((host, int(port), label))
+            out.append((host, int(port), label, noise_psk))
     except Exception:  # noqa: BLE001
         pass
     return out
@@ -142,6 +145,7 @@ class BluetoothApiConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self._usb_port: str = CONF_USB_PORT_DEFAULT
         self._esphome_host: str = ""
         self._esphome_port: int = CONF_ESPHOME_PORT_DEFAULT
+        self._esphome_noise_psk: str = ""
         self._device_name: str = CONF_DEVICE_NAME_DEFAULT
         self._passcode: int = _generate_passcode()
 
@@ -209,7 +213,15 @@ class BluetoothApiConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     async def async_step_esphome(
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
-        """Step 2b (ESPHome only): pick host:port from existing ESPHome integration entries."""
+        """Step 2b (ESPHome only): pick host:port from existing ESPHome integration entries.
+
+        Picking from this list also auto-harvests the device's `noise_psk` from
+        the existing ESPHome integration entry, so encrypted devices work
+        without re-typing the key.
+        """
+        devices = _list_esphome_devices(self.hass)
+        psk_by_host: dict[str, str] = {f"{h}|{p}": psk for h, p, _, psk in devices}
+
         if user_input is not None:
             choice = user_input[CONF_ESPHOME_HOST]
             if choice == MANUAL_PORT_SENTINEL:
@@ -217,10 +229,10 @@ class BluetoothApiConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             host_str, _, port_str = choice.partition("|")
             self._esphome_host = host_str
             self._esphome_port = int(port_str) if port_str else CONF_ESPHOME_PORT_DEFAULT
+            self._esphome_noise_psk = psk_by_host.get(choice, "")
             return await self.async_step_confirm()
 
-        devices = _list_esphome_devices(self.hass)
-        options: dict[str, str] = {f"{h}|{p}": label for h, p, label in devices}
+        options: dict[str, str] = {f"{h}|{p}": label for h, p, label, _ in devices}
         options[MANUAL_PORT_SENTINEL] = "Manuell eingeben…"
         default = next(iter(options.keys()), MANUAL_PORT_SENTINEL)
 
@@ -232,10 +244,11 @@ class BluetoothApiConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     async def async_step_esphome_manual(
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
-        """Step 2b-fallback: free-text host + port for the ESPHome native API."""
+        """Step 2b-fallback: free-text host + port + optional noise PSK for the ESPHome native API."""
         if user_input is not None:
             self._esphome_host = user_input[CONF_ESPHOME_HOST].strip()
             self._esphome_port = int(user_input.get(CONF_ESPHOME_PORT, CONF_ESPHOME_PORT_DEFAULT))
+            self._esphome_noise_psk = user_input.get(CONF_ESPHOME_NOISE_PSK, "").strip()
             return await self.async_step_confirm()
 
         schema = vol.Schema(
@@ -244,6 +257,7 @@ class BluetoothApiConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 vol.Optional(CONF_ESPHOME_PORT, default=CONF_ESPHOME_PORT_DEFAULT): vol.All(
                     vol.Coerce(int), vol.Range(min=1, max=65535)
                 ),
+                vol.Optional(CONF_ESPHOME_NOISE_PSK, default=""): str,
             }
         )
         return self.async_show_form(step_id="esphome_manual", data_schema=schema)
@@ -266,6 +280,7 @@ class BluetoothApiConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     CONF_USB_PORT: self._usb_port,
                     CONF_ESPHOME_HOST: self._esphome_host,
                     CONF_ESPHOME_PORT: self._esphome_port,
+                    CONF_ESPHOME_NOISE_PSK: self._esphome_noise_psk,
                     CONF_DEVICE_NAME: self._device_name,
                     CONF_PASSCODE: self._passcode,
                 },

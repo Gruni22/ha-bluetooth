@@ -28,6 +28,7 @@ from .const import (
     CONF_DEVICE_NAME,
     CONF_DEVICE_NAME_DEFAULT,
     CONF_ESPHOME_HOST,
+    CONF_ESPHOME_NOISE_PSK,
     CONF_ESPHOME_PORT,
     CONF_ESPHOME_PORT_DEFAULT,
     CONF_PASSCODE,
@@ -74,10 +75,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         host: str = entry.data.get(CONF_ESPHOME_HOST, "")
         port: int = int(entry.data.get(CONF_ESPHOME_PORT, CONF_ESPHOME_PORT_DEFAULT))
+        noise_psk: str = entry.data.get(CONF_ESPHOME_NOISE_PSK, "") or ""
         if not host:
             _LOGGER.error("ESPHome adapter mode selected but no host configured")
             return False
-        server = EsphomeApiServer(hass, host=host, port=port, passcode=passcode)
+        server = EsphomeApiServer(
+            hass, host=host, port=port, passcode=passcode, noise_psk=noise_psk
+        )
         try:
             await server.start()
             _LOGGER.info("Bluetooth API ESPHome bridge starting → %s:%d", host, port)

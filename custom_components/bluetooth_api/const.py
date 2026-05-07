@@ -16,13 +16,14 @@ CONF_USB_PORT = "usb_port"
 CONF_USB_PORT_DEFAULT = "/dev/ttyACM0"
 
 # ESPHome native API (only used when adapter_mode == "esphome")
-# NOTE: ESPHome 2026.1.0 removed legacy password authentication. Connecting to a
-# remote ble_server device only requires host/port; the API must be configured
-# without an `encryption_key:` (plaintext) — noise encryption is not supported
-# by this transport in v1.
+# Supports both plaintext (`api:` without encryption_key) and noise-encrypted
+# (`api: encryption: key: <base64>`) ESPHome devices. CONF_ESPHOME_NOISE_PSK is
+# the base64-encoded 32-byte pre-shared key copied verbatim from the device's
+# `api: encryption: key:` entry; leave empty for plaintext.
 CONF_ESPHOME_HOST = "esphome_host"
 CONF_ESPHOME_PORT = "esphome_port"
 CONF_ESPHOME_PORT_DEFAULT = 6053
+CONF_ESPHOME_NOISE_PSK = "esphome_noise_psk"
 
 # ble_server protobuf message IDs (must match esphome/components/api/api.proto)
 BLE_SERVER_SUBSCRIBE_REQUEST_ID = 149
