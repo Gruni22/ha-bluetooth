@@ -191,7 +191,7 @@ class _NoiseFrame:
         )
         n = NoiseConnection.from_name(_NOISE_PROTOCOL)
         n.set_as_initiator()
-        n.set_psks([self._psk])
+        n.set_psks(psks=[self._psk])
         n.set_prologue(prologue)
         n.start_handshake()
         self._noise = n
