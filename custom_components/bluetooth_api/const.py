@@ -44,6 +44,13 @@ CONF_PASSCODE = "passcode"
 LABEL_BTDASH = "BTDASH"        # phone/tablet UI
 LABEL_BTDASHAA = "BTDASHAA"    # Android Auto
 
+# Dashboards in the btdashboard app are derived from labels carrying this
+# prefix (e.g. "DASH_Battery" → app dashboard "Battery"). The entities that
+# show up in a dashboard are those carrying its DASH_* label AND at least one
+# of BTDASH / BTDASHAA. This replaces the old "view title contains 'aa'"
+# heuristic for splitting phone vs Android Auto dashboards.
+DASH_LABEL_PREFIX = "DASH_"
+
 # BLE device name advertised
 CONF_DEVICE_NAME = "device_name"
 CONF_DEVICE_NAME_DEFAULT = "Homeassistant_Home"

@@ -46,11 +46,6 @@ def _generate_passcode() -> int:
     return random.SystemRandom().getrandbits(32)
 
 
-def _passcode_display(passcode: int) -> str:
-    hex_str = f"{passcode:08X}"
-    return f"{hex_str[:4]}-{hex_str[4:]}"
-
-
 def _list_serial_ports() -> list[tuple[str, str, int]]:
     """Scan for serial ports. Returns [(path, label, score)], sorted best-first.
 
@@ -160,7 +155,7 @@ class BluetoothApiConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 return await self.async_step_esp32()
             if self._adapter_mode == ADAPTER_MODE_ESPHOME:
                 return await self.async_step_esphome()
-            return await self.async_step_confirm()
+            return self._finish()
 
         schema = vol.Schema(
             {
@@ -185,7 +180,7 @@ class BluetoothApiConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             if choice == MANUAL_PORT_SENTINEL:
                 return await self.async_step_esp32_manual()
             self._usb_port = choice
-            return await self.async_step_confirm()
+            return self._finish()
 
         ports = await self.hass.async_add_executor_job(_list_serial_ports)
         options: dict[str, str] = {path: label for path, label, _ in ports}
@@ -203,7 +198,7 @@ class BluetoothApiConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         """Step 2a-fallback: free-text USB port."""
         if user_input is not None:
             self._usb_port = user_input.get(CONF_USB_PORT, CONF_USB_PORT_DEFAULT)
-            return await self.async_step_confirm()
+            return self._finish()
 
         schema = vol.Schema(
             {vol.Optional(CONF_USB_PORT, default=CONF_USB_PORT_DEFAULT): str}
@@ -230,7 +225,7 @@ class BluetoothApiConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             self._esphome_host = host_str
             self._esphome_port = int(port_str) if port_str else CONF_ESPHOME_PORT_DEFAULT
             self._esphome_noise_psk = psk_by_host.get(choice, "")
-            return await self.async_step_confirm()
+            return self._finish()
 
         options: dict[str, str] = {f"{h}|{p}": label for h, p, label, _ in devices}
         options[MANUAL_PORT_SENTINEL] = "Manuell eingeben…"
@@ -249,7 +244,7 @@ class BluetoothApiConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             self._esphome_host = user_input[CONF_ESPHOME_HOST].strip()
             self._esphome_port = int(user_input.get(CONF_ESPHOME_PORT, CONF_ESPHOME_PORT_DEFAULT))
             self._esphome_noise_psk = user_input.get(CONF_ESPHOME_NOISE_PSK, "").strip()
-            return await self.async_step_confirm()
+            return self._finish()
 
         schema = vol.Schema(
             {
@@ -262,39 +257,28 @@ class BluetoothApiConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         )
         return self.async_show_form(step_id="esphome_manual", data_schema=schema)
 
-    async def async_step_confirm(
-        self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
-        """Step 3: show generated passcode (used in the QR code), let user confirm."""
-        if user_input is not None:
-            if self._adapter_mode == ADAPTER_MODE_ESP32:
-                title = f"Bluetooth API (ESP32, {self._usb_port})"
-            elif self._adapter_mode == ADAPTER_MODE_ESPHOME:
-                title = f"Bluetooth API (ESPHome, {self._esphome_host}:{self._esphome_port})"
-            else:
-                title = f"Bluetooth API (Native Pi BT, {self._device_name})"
-            return self.async_create_entry(
-                title=title,
-                data={
-                    CONF_ADAPTER_MODE: self._adapter_mode,
-                    CONF_USB_PORT: self._usb_port,
-                    CONF_ESPHOME_HOST: self._esphome_host,
-                    CONF_ESPHOME_PORT: self._esphome_port,
-                    CONF_ESPHOME_NOISE_PSK: self._esphome_noise_psk,
-                    CONF_DEVICE_NAME: self._device_name,
-                    CONF_PASSCODE: self._passcode,
-                },
-            )
+    def _finish(self) -> FlowResult:
+        """Create the config entry — no extra confirmation step.
 
-        passcode_str = _passcode_display(self._passcode)
-        description = (
-            f"Passcode: **{passcode_str}**\n\n"
-            f"Nach der Einrichtung findest du den QR-Code unter:\n"
-            f"`/api/bluetooth_api/setup_qr`\n\n"
-            f"Scanne ihn in der btdashboard-App beim Einrichten."
-        )
-        return self.async_show_form(
-            step_id="confirm",
-            data_schema=vol.Schema({}),
-            description_placeholders={"passcode": passcode_str, "info": description},
+        The passcode is auto-generated and shown to the user via a persistent
+        notification *after* setup (so the QR endpoint can serve it). Forcing
+        an extra empty form click before that happens was just noise.
+        """
+        if self._adapter_mode == ADAPTER_MODE_ESP32:
+            title = f"Bluetooth API (ESP32, {self._usb_port})"
+        elif self._adapter_mode == ADAPTER_MODE_ESPHOME:
+            title = f"Bluetooth API (ESPHome, {self._esphome_host}:{self._esphome_port})"
+        else:
+            title = f"Bluetooth API (Native Pi BT, {self._device_name})"
+        return self.async_create_entry(
+            title=title,
+            data={
+                CONF_ADAPTER_MODE: self._adapter_mode,
+                CONF_USB_PORT: self._usb_port,
+                CONF_ESPHOME_HOST: self._esphome_host,
+                CONF_ESPHOME_PORT: self._esphome_port,
+                CONF_ESPHOME_NOISE_PSK: self._esphome_noise_psk,
+                CONF_DEVICE_NAME: self._device_name,
+                CONF_PASSCODE: self._passcode,
+            },
         )

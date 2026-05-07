@@ -44,6 +44,7 @@ from .const import (
     CMD_REQ_DEVICES,
     CMD_REQ_STATE,
     CMD_STATE_CHANGE,
+    DASH_LABEL_PREFIX,
     LABEL_BTDASH,
     LABEL_BTDASHAA,
 )
@@ -220,52 +221,66 @@ class PacketDispatcher:
         await self._send_packet(CMD_ANS_DEVICES, entities)
 
     async def _handle_req_dashboards(self) -> None:
-        dashboards: list[dict] = []
-        try:
-            lovelace_data = self._hass.data.get("lovelace")
-            ll_dashboards = (
-                getattr(lovelace_data, "dashboards", None)
-                or (lovelace_data or {}).get("dashboards")
-                or {}
-            )
-            for url_path, ll_config in ll_dashboards.items():
-                try:
-                    raw = await ll_config.async_get_info()
-                except Exception:  # noqa: BLE001
-                    raw = {}
-                try:
-                    cfg = await ll_config.async_load(force=False)
-                except Exception:  # noqa: BLE001
-                    cfg = {}
-                if not isinstance(cfg, dict):
-                    cfg = {}
-                effective_url = url_path or "lovelace"
-                title = (
-                    raw.get("title")
-                    or cfg.get("title")
-                    or ("Übersicht" if url_path is None else effective_url)
-                )
-                views = cfg.get("views", []) or []
-                dashboards.append({
-                    "id": effective_url,
-                    "url_path": effective_url,
+        """Return dashboards derived from `DASH_*` labels (not Lovelace).
+
+        Each label whose name starts with `DASH_` becomes an app dashboard,
+        with title = name minus the prefix. Entities in the dashboard are
+        those carrying the label (entity- or device-level) AND at least one
+        of BTDASH / BTDASHAA — so an unfiltered DASH_X label that's never
+        combined with an exposure label produces an empty dashboard.
+
+        The app handles phone-vs-Android-Auto routing itself by checking each
+        entity's `labels` (already shipped in ANS_DEVICES) for BTDASH /
+        BTDASHAA.
+        """
+        from homeassistant.helpers import (
+            device_registry as dr,
+            entity_registry as er,
+            label_registry as lr,
+        )
+        label_reg = lr.async_get(self._hass)
+        ent_reg = er.async_get(self._hass)
+        dev_reg = dr.async_get(self._hass)
+
+        exposure_ids = _exposure_label_ids(label_reg)
+        dash_labels = [
+            label for label in label_reg.async_list_labels()
+            if label.name.startswith(DASH_LABEL_PREFIX)
+        ]
+        if not dash_labels:
+            await self._send_packet(CMD_ANS_DASHBOARDS, [])
+            return
+
+        # Bucket exposed entities into their DASH_* labels in one pass.
+        dash_label_ids = {l.label_id for l in dash_labels}
+        buckets: dict[str, list[str]] = {lid: [] for lid in dash_label_ids}
+        for entry in ent_reg.entities.values():
+            labels = _entity_label_ids(entry, dev_reg)
+            if exposure_ids and not (labels & exposure_ids):
+                continue
+            for lid in labels & dash_label_ids:
+                buckets[lid].append(entry.entity_id)
+
+        dashboards = []
+        for label in dash_labels:
+            title = label.name[len(DASH_LABEL_PREFIX):] or label.name
+            url_path = title.lower()
+            entity_ids = sorted(buckets[label.label_id])
+            dashboards.append({
+                "id": label.label_id,
+                "url_path": url_path,
+                "title": title,
+                # Single view per label-derived dashboard. The schema preserves
+                # the views[] shape so the app's existing dashboard renderer
+                # keeps working without changes.
+                "views": [{
+                    "id": label.label_id,
+                    "path": url_path,
                     "title": title,
-                    "views": [
-                        {
-                            "id": f"{effective_url}_v{i}",
-                            "path": v.get("path", str(i)),
-                            "title": v.get("title", f"View {i}"),
-                            "entity_ids": _extract_entity_ids(v),
-                        }
-                        for i, v in enumerate(views)
-                    ],
-                })
-        except Exception as exc:  # noqa: BLE001
-            _LOGGER.warning("Failed to enumerate dashboards: %s", exc)
-
-        if not dashboards:
-            dashboards.append({"id": "lovelace", "url_path": "lovelace", "title": "Home", "views": []})
-
+                    "entity_ids": entity_ids,
+                }],
+            })
+        dashboards.sort(key=lambda d: d["title"].lower())
         await self._send_packet(CMD_ANS_DASHBOARDS, dashboards)
 
     async def _handle_req_state(self, entity_id: str) -> None:
@@ -403,28 +418,3 @@ def _is_exposed(hass: HomeAssistant, entity_id: str) -> bool:
     return bool(label_ids & _exposure_label_ids(lr.async_get(hass)))
 
 
-def _extract_entity_ids(node: object) -> list[str]:
-    ids: list[str] = []
-
-    def looks_like_entity_id(s: str) -> bool:
-        return "." in s and not s.startswith(".") and " " not in s
-
-    def walk(n: object) -> None:
-        if isinstance(n, dict):
-            for key in ("entity", "entity_id"):
-                v = n.get(key)
-                if isinstance(v, str) and looks_like_entity_id(v):
-                    ids.append(v)
-            for key in ("cards", "entities", "sections", "badges", "elements", "views"):
-                child = n.get(key)
-                if isinstance(child, list):
-                    for c in child:
-                        walk(c)
-        elif isinstance(n, str) and looks_like_entity_id(n):
-            ids.append(n)
-        elif isinstance(n, list):
-            for c in n:
-                walk(c)
-
-    walk(node)
-    return list(dict.fromkeys(ids))
