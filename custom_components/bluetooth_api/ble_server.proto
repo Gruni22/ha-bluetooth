@@ -1,0 +1,18 @@
+syntax = "proto3";
+
+package bluetooth_api;
+
+// Mirrors the message definitions added to esphome/components/api/api.proto
+// (IDs 149, 150, 151). aioesphomeapi does not ship these out of the box, so
+// the bluetooth_api integration generates and registers them at runtime.
+
+message SubscribeBleServerFramesRequest {
+}
+
+message BleServerFrameResponse {
+  bytes data = 1;
+}
+
+message BleServerSendFrameRequest {
+  bytes data = 1;
+}
