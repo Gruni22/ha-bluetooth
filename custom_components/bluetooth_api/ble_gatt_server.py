@@ -449,33 +449,27 @@ class HaBleGattServer:
             loop.call_soon_threadsafe(self._on_frame, frame)
 
 
-# UUIDs whose services typically have at least one characteristic with the SMP
-# encryption-required flag set. When BlueZ has these registered (because the
-# `audio` / `input` plugins are loaded) Android walks them during GATT
-# discovery, sees the flag, and pops the pairing dialog — even though our own
-# service has no auth requirements. We can't unload these from a non-host
-# context (HAOS sandboxing), so we flag them so the user can fix it once on
-# the host. UUID strings are lower-case to match BlueZ's reporting.
+# BLE GATT services with at least one auth-required characteristic. Android
+# walks these during post-connect GATT discovery; if it sees the flag, it
+# pops the pairing dialog even though our own service has no auth needs.
+# Classic-only profiles (HSP/HFP/A2DP/AVRC etc.) are deliberately *not* in
+# this table — Android only finds those via SDP, which it doesn't run for a
+# BLE peripheral, so they don't trigger pairing for our flow.
+# Fix on HAOS hosts: install the udev hook from
+# `tools/haos-disable-bluez-plugins/` (sets `--noplugin=*` in a runtime
+# systemd drop-in for `bluetooth.service`).
 _LEAKING_UUID_TABLE: dict[str, str] = {
-    # Classic profiles (SDP) — present on the same controller and listed in
-    # bluetoothctl, also surface as device-class hints to Android.
-    "00001108-0000-1000-8000-00805f9b34fb": "Headset (HSP)",
-    "0000110a-0000-1000-8000-00805f9b34fb": "A2DP Audio Source",
-    "0000110b-0000-1000-8000-00805f9b34fb": "A2DP Audio Sink",
-    "0000110c-0000-1000-8000-00805f9b34fb": "AVRCP Target",
-    "0000110e-0000-1000-8000-00805f9b34fb": "AVRCP Controller",
-    "00001112-0000-1000-8000-00805f9b34fb": "Headset Audio Gateway",
-    "0000111e-0000-1000-8000-00805f9b34fb": "Hands-Free (HFP)",
-    "0000111f-0000-1000-8000-00805f9b34fb": "Hands-Free Audio Gateway",
-    "00001124-0000-1000-8000-00805f9b34fb": "HID over Bluetooth",
-    "00001200-0000-1000-8000-00805f9b34fb": "PnP Information (DI)",
-    # LE Audio / GATT — these *are* on the BLE side and the actual primary
-    # cause of pairing prompts during BLE GATT discovery.
-    "00001843-0000-1000-8000-00805f9b34fb": "Audio Input Control (LE)",
-    "00001844-0000-1000-8000-00805f9b34fb": "Volume Control (LE)",
-    "00001845-0000-1000-8000-00805f9b34fb": "Volume Offset Control (LE)",
-    "0000184d-0000-1000-8000-00805f9b34fb": "Microphone Control (LE)",
-    "0000184f-0000-1000-8000-00805f9b34fb": "Broadcast Audio Scan (LE)",
+    "00001812-0000-1000-8000-00805f9b34fb": "HID over GATT (HOGP)",
+    "0000180f-0000-1000-8000-00805f9b34fb": "Battery Service",
+    "00001843-0000-1000-8000-00805f9b34fb": "Audio Input Control (AICS)",
+    "00001844-0000-1000-8000-00805f9b34fb": "Volume Control (VCS)",
+    "00001845-0000-1000-8000-00805f9b34fb": "Volume Offset Control (VOCS)",
+    "0000184d-0000-1000-8000-00805f9b34fb": "Microphone Control (MICS)",
+    "0000184e-0000-1000-8000-00805f9b34fb": "ASHA (Hearing Aid)",
+    "0000184f-0000-1000-8000-00805f9b34fb": "Broadcast Audio Scan (BASS)",
+    "00001850-0000-1000-8000-00805f9b34fb": "Published Audio Capabilities (PACS)",
+    "00001853-0000-1000-8000-00805f9b34fb": "Common Audio Service (CAS)",
+    "00001854-0000-1000-8000-00805f9b34fb": "Hearing Access Service (HAS)",
 }
 
 
@@ -559,18 +553,43 @@ class NativeBleServer(PacketDispatcher):
 
         bullet_list = "\n".join(f"- {name}" for name in leaks)
         message = (
-            "Native BT mode is up, but BlueZ on this Pi has extra services "
-            "loaded that will trigger an Android pairing dialog during GATT "
+            "Native BT mode is up, but BlueZ on this Pi exposes extra GATT "
+            "services that trigger an Android pairing dialog during BLE "
             "discovery:\n\n"
             f"{bullet_list}\n\n"
-            "**Fix on the HAOS host (port 22222 SSH or HDMI console):**\n\n"
+            "**Fix on the HAOS host** (SSH on port 22222 or HDMI console). "
+            "Run these once — the udev rule survives reboots and keeps the "
+            "drop-in in place across HAOS updates:\n\n"
             "```sh\n"
-            "sed -i '/^\\[General\\]$/a DisablePlugins = audio,input,sap' "
-            "/etc/bluetooth/main.conf\n"
+            "mkdir -p /mnt/data/btconfig\n"
+            "cat > /mnt/data/btconfig/disable-plugins.sh <<'SCRIPT'\n"
+            "#!/bin/sh\n"
+            "set -eu\n"
+            "DROPIN_DIR=/run/systemd/system/bluetooth.service.d\n"
+            'mkdir -p "$DROPIN_DIR"\n'
+            'cat > "$DROPIN_DIR/zz-bluetooth-api-noplugin.conf" <<EOF\n'
+            "[Service]\n"
+            "ExecStart=\n"
+            "ExecStart=/usr/libexec/bluetooth/bluetoothd --noplugin=*\n"
+            "EOF\n"
+            "systemctl daemon-reload\n"
+            "PID=$(pgrep -f /usr/libexec/bluetooth/bluetoothd | head -1 || true)\n"
+            'if [ -n "$PID" ]; then\n'
+            '  CMDLINE=$(tr "\\0" " " < /proc/$PID/cmdline 2>/dev/null || true)\n'
+            '  case "$CMDLINE" in *"--noplugin=*"*) exit 0 ;; esac\n'
+            "fi\n"
             "systemctl restart bluetooth\n"
+            "SCRIPT\n"
+            "chmod +x /mnt/data/btconfig/disable-plugins.sh\n"
+            "cat > /etc/udev/rules.d/99-bluetooth-api-noplugin.rules <<'RULE'\n"
+            'ACTION=="add", SUBSYSTEM=="bluetooth", KERNEL=="hci[0-9]*", '
+            'RUN+="/usr/bin/systemd-run --no-block --unit=bt-api-noplugin /mnt/data/btconfig/disable-plugins.sh"\n'
+            "RULE\n"
+            "udevadm control --reload-rules\n"
+            "/mnt/data/btconfig/disable-plugins.sh\n"
             "```\n\n"
-            "Reload the Bluetooth API integration afterwards. This "
-            "notification disappears automatically once the adapter is clean."
+            "Then reload the Bluetooth API integration. This notification "
+            "auto-dismisses once the adapter is clean."
         )
         await self._hass.services.async_call(
             "persistent_notification", "create",
