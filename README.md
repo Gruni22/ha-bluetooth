@@ -43,10 +43,12 @@ The custom component talks to the HA Core API directly (`hass.states`, `hass.ser
 ### Key points
 
 - **Three adapter modes** — pick at setup: ESP32-S3 over USB, an existing ESPHome device with the `ble_server` component over WiFi, or the Pi's own Bluetooth adapter via [bless](https://pypi.org/project/bless/).
+- **Multi-instance** — configure several gateways at once, the app talks to all of them in parallel. Same `entity_id` from two HAs stays distinct (compound-key routing); a small "via *gateway-name*" caption appears under each tile when there's more than one device configured.
 - **Open BLE** — no pairing dialog, no bonding, no LTK. Authentication happens at the application layer via a 32-bit passcode embedded in every packet.
 - **Local control** — all data stays on the LAN/PAN. No external service, no internet.
 - **Label-based exposure filter** — only entities (or their parent devices) carrying the auto-created labels `BTDASH` / `BTDASHAA` are pushed to the app. Dashboards in the app are derived from `DASH_*` labels (e.g. `DASH_Battery` → app dashboard "Battery").
 - **Auto-sync** — areas, devices and dashboards sync into a local Room database on first setup; state changes are pushed live, scoped to the exposure filter.
+- **Rich domain controls** — climate stepper (HA-style up/down + HVAC mode chips), cover position slider, vacuum start/pause/dock, scene one-shot, input_number/number slider, input_select/select dropdown, humidifier humidity slider — all with sensible default ranges (5..30 °C climate, etc.).
 - **Android Auto-ready** — the companion app's `CarAppService` picks up entities labelled `BTDASHAA`.
 
 ---
@@ -81,6 +83,44 @@ After clicking "Add Integration" the wizard branches by adapter mode:
 | **2a. USB port** | ESP32 only | Auto-discovery dropdown — Espressif VID `0x303A` is shown at the top, plus common USB-UART bridges. "Manual entry…" as fallback. |
 | **2b. ESPHome host** | ESPHome only | Dropdown harvested from your existing ESPHome integrations — host, port and `noise_psk` are pulled in automatically. Manual entry as fallback. |
 | **2c. Conflict check** | Native only — and only when needed | If HA's own Bluetooth integration is enabled it'll fight bless for the adapter. The wizard lists conflicting entries and offers a one-click *disable* (they stay configured, just stopped). Skipped silently when no conflict. |
+
+#### Native mode — one-time HAOS host fix
+
+`bluetoothd` on HAOS loads LE-Audio + HID-over-GATT plugins by default; their auth-required GATT services pop a pairing dialog on Android during BLE discovery. Disabling these plugins requires a one-time host-shell setup (rootfs is read-only erofs, so it must come through a runtime systemd drop-in driven by udev):
+
+1. **Enable HAOS host SSH on port 22222.** Generate a keypair, format a USB stick FAT32 with label `CONFIG`, drop your public key as `authorized_keys` (no extension) at the root, plug it in, then run `ha os import` from the SSH addon. SSH on port 22222 with the matching private key.
+2. **Run this script once** (from the host shell):
+   ```sh
+   mkdir -p /mnt/data/btconfig
+   cat > /mnt/data/btconfig/disable-plugins.sh <<'SCRIPT'
+   #!/bin/sh
+   set -eu
+   DROPIN_DIR=/run/systemd/system/bluetooth.service.d
+   DROPIN_FILE="$DROPIN_DIR/zz-bluetooth-api-noplugin.conf"
+   FLAGS="--noplugin=hog,micp,asha,bap,vcp,bass,csip,mcp,pacs"
+   mkdir -p "$DROPIN_DIR"
+   cat > "$DROPIN_FILE" <<EOF
+   [Service]
+   ExecStart=
+   ExecStart=/usr/libexec/bluetooth/bluetoothd $FLAGS
+   EOF
+   systemctl daemon-reload
+   PID=$(pgrep -f /usr/libexec/bluetooth/bluetoothd | head -1 || true)
+   if [ -n "$PID" ]; then
+     CMDLINE=$(tr '\0' ' ' < /proc/$PID/cmdline 2>/dev/null || true)
+     case "$CMDLINE" in *"$FLAGS"*) exit 0 ;; esac
+   fi
+   systemctl restart bluetooth
+   SCRIPT
+   chmod +x /mnt/data/btconfig/disable-plugins.sh
+   cat > /etc/udev/rules.d/99-bluetooth-api-noplugin.rules <<'RULE'
+   ACTION=="add", SUBSYSTEM=="bluetooth", KERNEL=="hci[0-9]*", RUN+="/usr/bin/systemd-run --no-block --unit=bt-api-noplugin /mnt/data/btconfig/disable-plugins.sh"
+   RULE
+   udevadm control --reload-rules
+   /mnt/data/btconfig/disable-plugins.sh
+   ```
+   The udev rule + script live on the writable persistent partition; the systemd drop-in itself is in `/run` (tmpfs) and gets recreated on every boot. Survives HAOS updates.
+3. **The integration auto-detects the leak** — if anything in the leaking-UUID table is still on the adapter after setup, it posts a persistent notification with the exact commands above. The notification auto-dismisses once the adapter is clean.
 
 After "Submit" the entry is created and a **Persistent Notification** is posted with the passcode and a QR-code link at `/api/bluetooth_api/setup_qr/<entry_id>` — scan that during app setup.
 
