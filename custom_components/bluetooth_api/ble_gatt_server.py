@@ -558,25 +558,30 @@ class NativeBleServer(PacketDispatcher):
             "discovery:\n\n"
             f"{bullet_list}\n\n"
             "**Fix on the HAOS host** (SSH on port 22222 or HDMI console). "
-            "Run these once — the udev rule survives reboots and keeps the "
-            "drop-in in place across HAOS updates:\n\n"
+            "Run this block once — the udev rule survives reboots and keeps "
+            "the drop-in in place across HAOS updates:\n\n"
             "```sh\n"
             "mkdir -p /mnt/data/btconfig\n"
             "cat > /mnt/data/btconfig/disable-plugins.sh <<'SCRIPT'\n"
             "#!/bin/sh\n"
+            "# Disable BlueZ plugins that register BLE GATT services with\n"
+            "# auth-required characteristics (LE Audio family + HID-over-GATT).\n"
+            "# Idempotent; triggered by udev when the BT controller appears.\n"
             "set -eu\n"
             "DROPIN_DIR=/run/systemd/system/bluetooth.service.d\n"
+            'DROPIN_FILE="$DROPIN_DIR/zz-bluetooth-api-noplugin.conf"\n'
+            'FLAGS="--noplugin=hog,micp,asha,bap,vcp,bass,csip,mcp,pacs"\n'
             'mkdir -p "$DROPIN_DIR"\n'
-            'cat > "$DROPIN_DIR/zz-bluetooth-api-noplugin.conf" <<EOF\n'
+            'cat > "$DROPIN_FILE" <<EOF\n'
             "[Service]\n"
             "ExecStart=\n"
-            "ExecStart=/usr/libexec/bluetooth/bluetoothd --noplugin=*\n"
+            "ExecStart=/usr/libexec/bluetooth/bluetoothd $FLAGS\n"
             "EOF\n"
             "systemctl daemon-reload\n"
             "PID=$(pgrep -f /usr/libexec/bluetooth/bluetoothd | head -1 || true)\n"
             'if [ -n "$PID" ]; then\n'
             '  CMDLINE=$(tr "\\0" " " < /proc/$PID/cmdline 2>/dev/null || true)\n'
-            '  case "$CMDLINE" in *"--noplugin=*"*) exit 0 ;; esac\n'
+            '  case "$CMDLINE" in *"$FLAGS"*) exit 0 ;; esac\n'
             "fi\n"
             "systemctl restart bluetooth\n"
             "SCRIPT\n"
@@ -588,8 +593,14 @@ class NativeBleServer(PacketDispatcher):
             "udevadm control --reload-rules\n"
             "/mnt/data/btconfig/disable-plugins.sh\n"
             "```\n\n"
-            "Then reload the Bluetooth API integration. This notification "
-            "auto-dismisses once the adapter is clean."
+            "Then reload the Bluetooth API integration so bless re-registers "
+            "on the freshly-restarted bluetoothd. This notification "
+            "auto-dismisses once the adapter is clean.\n\n"
+            "*Note: Generic Access (0x1800) and Generic Attribute (0x1801) "
+            "are mandatory BLE services, always present, never trigger "
+            "pairing. Classic-only profiles like A2DP / AVRC / HSP / HFP "
+            "show up in `bluetoothctl show` but are invisible to Android's "
+            "BLE GATT discovery — they don't affect this flow.*"
         )
         await self._hass.services.async_call(
             "persistent_notification", "create",

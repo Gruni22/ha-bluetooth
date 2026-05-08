@@ -354,11 +354,18 @@ _SLIM_ATTR_KEYS = frozenset((
     "percentage", "percentage_step",
     # cover
     "current_position",
-    # climate
+    # climate (incl. range thermostats)
     "hvac_modes", "min_temp", "max_temp", "current_temperature", "temperature",
+    "target_temp_low", "target_temp_high", "target_temp_step",
     "hvac_action", "preset_mode", "preset_modes",
     # media_player
     "media_title", "volume_level",
+    # number / input_number (slider bounds)
+    "min", "max", "step",
+    # select / input_select (dropdown options)
+    "options",
+    # humidifier
+    "humidity", "min_humidity", "max_humidity",
 ))
 
 
