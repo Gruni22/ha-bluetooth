@@ -165,78 +165,148 @@ class HaBleGattServer:
         except Exception as exc:  # noqa: BLE001
             _LOGGER.error("BLE GATT server error: %s", exc)
 
-    async def _run_cmd(self, *args: str) -> None:
-        """Run a shell command, suppressing all output."""
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *args,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            await asyncio.wait_for(proc.wait(), timeout=5.0)
-        except Exception as exc:  # noqa: BLE001
-            _LOGGER.debug("BLE: command %s failed: %s", args, exc)
-
     async def _configure_adapter(self) -> None:
         """Configure BlueZ for Open BLE — no SMP Security Requests, no pairing dialogs.
 
-        Root cause of pairing dialogs: when BlueZ has a stored bond (LTK) for the phone,
-        or when pairable=on, it sends an SMP Security Request on every new LE connection,
-        causing Android to show a pairing dialog (which we cannot auto-confirm without
-        BLUETOOTH_PRIVILEGED — confirmed SecurityException on API 36).
+        Root cause of pairing dialogs: when BlueZ has a stored bond (LTK) for the
+        phone, or when `Pairable=true`, BlueZ sends an SMP Security Request on
+        every new LE connection. Android then shows a pairing dialog which we
+        cannot auto-confirm without `BLUETOOTH_PRIVILEGED` (`SecurityException`
+        on API 36).
 
-        Two-part fix:
-        1. Clear all cached devices (removes any stored LTKs) so BlueZ has no reason
-           to initiate SMP re-encryption on reconnect.
-        2. Set pairable=off so BlueZ does not send SMP Security Request for new devices.
+        Three-part hardening, applied in order:
+          1. Set `Pairable=false` and `Discoverable=true` on the adapter via the
+             BlueZ D-Bus interface (org.bluez.Adapter1). D-Bus because (a) bless
+             already speaks it, so the dependency is free, (b) `bluetoothctl`
+             may not even be in PATH inside HAOS-style containers, and (c) we
+             can actually log what worked.
+          2. Walk every `org.bluez.Device1` under our adapter and call
+             `RemoveDevice` on the disconnected ones. This wipes cached LTKs so
+             BlueZ has no reason to re-encrypt on reconnect.
+          3. Fall back to `bluetoothctl` only if D-Bus is unavailable — and
+             this time actually capture stderr so failures surface in the log.
 
-        Result: connections are pure Open BLE — unencrypted at link layer, secured at the
-        application layer via the 32-bit passcode present in every packet.
+        Result: link layer unencrypted, no Pi-side bond, authentication lives
+        one layer up in the 32-bit passcode each packet carries.
         """
-        await self._clear_bluez_device_cache()
-        await self._run_cmd("bluetoothctl", "pairable", "off")
-        await self._run_cmd("bluetoothctl", "agent", "NoInputNoOutput")
-        await self._run_cmd("bluetoothctl", "default-agent")
-        _LOGGER.debug("BLE: adapter configured (pairable=off, LTKs cleared)")
+        ok = await self._configure_via_dbus()
+        if not ok:
+            _LOGGER.warning("BLE: D-Bus path failed, falling back to bluetoothctl")
+            await self._configure_via_bluetoothctl()
 
-    async def _clear_bluez_device_cache(self) -> None:
-        """Remove all non-connected devices from BlueZ to prevent stale SMP keys."""
+    async def _configure_via_dbus(self) -> bool:
+        """Set Pairable=false, Discoverable=true, and clear LTK cache via D-Bus.
+
+        Returns True if the adapter was configured successfully. Bless ships
+        with one of {dbus_fast, dbus_next} as a Linux dependency — we try
+        dbus_fast first (newer, faster) and fall back to dbus_next.
+        """
+        adapter_path = self._adapter_dbus_path()
         try:
-            # Collect all known devices
-            proc = await asyncio.create_subprocess_exec(
-                "bluetoothctl", "devices",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
-            all_macs: list[str] = []
-            for line in stdout.decode().splitlines():
-                parts = line.strip().split()
-                if len(parts) >= 2 and parts[0] == "Device":
-                    all_macs.append(parts[1])
-
-            # Collect currently-connected devices (skip removal to avoid disconnecting)
-            connected_macs: set[str] = set()
+            from dbus_fast import BusType, Variant
+            from dbus_fast.aio import MessageBus
+        except ImportError:
             try:
-                proc2 = await asyncio.create_subprocess_exec(
-                    "bluetoothctl", "devices", "Connected",
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.DEVNULL,
-                )
-                out2, _ = await asyncio.wait_for(proc2.communicate(), timeout=5.0)
-                for line in out2.decode().splitlines():
-                    parts = line.strip().split()
-                    if len(parts) >= 2 and parts[0] == "Device":
-                        connected_macs.add(parts[1])
-            except Exception:  # noqa: BLE001
-                pass  # older BlueZ may not support "devices Connected"
+                from dbus_next import BusType, Variant  # type: ignore[no-redef]
+                from dbus_next.aio import MessageBus  # type: ignore[no-redef]
+            except ImportError:
+                _LOGGER.debug("BLE: no D-Bus library available")
+                return False
 
-            for mac in all_macs:
-                if mac not in connected_macs:
-                    await self._run_cmd("bluetoothctl", "remove", mac)
-                    _LOGGER.debug("BLE: removed cached device %s", mac)
+        try:
+            bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
         except Exception as exc:  # noqa: BLE001
-            _LOGGER.debug("BLE: could not clear device cache: %s", exc)
+            _LOGGER.warning("BLE: D-Bus system bus connect failed: %s", exc)
+            return False
+
+        try:
+            adapter_intro = await bus.introspect("org.bluez", adapter_path)
+            adapter_obj = bus.get_proxy_object("org.bluez", adapter_path, adapter_intro)
+            adapter_props = adapter_obj.get_interface("org.freedesktop.DBus.Properties")
+
+            await adapter_props.call_set(
+                "org.bluez.Adapter1", "Pairable", Variant("b", False)
+            )
+            await adapter_props.call_set(
+                "org.bluez.Adapter1", "Discoverable", Variant("b", True)
+            )
+            _LOGGER.info(
+                "BLE: D-Bus set Pairable=false, Discoverable=true on %s",
+                adapter_path,
+            )
+
+            # ── Clear stale LTKs by removing every known disconnected device.
+            adapter_iface = adapter_obj.get_interface("org.bluez.Adapter1")
+            om_intro = await bus.introspect("org.bluez", "/")
+            om_obj = bus.get_proxy_object("org.bluez", "/", om_intro)
+            om = om_obj.get_interface("org.freedesktop.DBus.ObjectManager")
+            objects = await om.call_get_managed_objects()
+
+            adapter_prefix = adapter_path + "/"
+            removed = 0
+            for path, ifaces in objects.items():
+                if not path.startswith(adapter_prefix):
+                    continue
+                if "org.bluez.Device1" not in ifaces:
+                    continue
+                connected_v = ifaces["org.bluez.Device1"].get("Connected")
+                connected = bool(connected_v.value) if connected_v is not None else False
+                if connected:
+                    continue  # don't yank an active session
+                try:
+                    await adapter_iface.call_remove_device(path)
+                    removed += 1
+                except Exception as exc:  # noqa: BLE001
+                    _LOGGER.debug("BLE: RemoveDevice(%s) failed: %s", path, exc)
+            if removed:
+                _LOGGER.info("BLE: removed %d cached device(s) (LTKs cleared)", removed)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.warning("BLE: D-Bus adapter config failed: %s", exc)
+            return False
+        finally:
+            try:
+                bus.disconnect()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _adapter_dbus_path(self) -> str:
+        """Resolve `self._adapter` ("hci0" / None) to a BlueZ object path."""
+        adapter = self._adapter or "hci0"
+        if adapter.startswith("/org/bluez/"):
+            return adapter
+        return f"/org/bluez/{adapter}"
+
+    async def _configure_via_bluetoothctl(self) -> None:
+        """Fallback path. Logs stdout/stderr so silent failures stop being silent."""
+        for cmd in (
+            ("bluetoothctl", "pairable", "off"),
+            ("bluetoothctl", "agent", "NoInputNoOutput"),
+            ("bluetoothctl", "default-agent"),
+        ):
+            await self._run_cmd_logged(*cmd)
+
+    async def _run_cmd_logged(self, *args: str) -> None:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+            if proc.returncode != 0:
+                _LOGGER.warning(
+                    "BLE: %s exited %d — stderr=%s",
+                    " ".join(args),
+                    proc.returncode,
+                    stderr.decode(errors="replace").strip()[:200],
+                )
+            else:
+                _LOGGER.debug("BLE: %s ok", " ".join(args))
+        except FileNotFoundError:
+            _LOGGER.warning("BLE: %s not found in PATH — install bluez tools or rely on D-Bus", args[0])
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.warning("BLE: command %s failed: %s", args, exc)
 
     async def _disconnect_detector(self) -> None:
         """Poll bluetoothctl every 5 s to detect client disconnection.
