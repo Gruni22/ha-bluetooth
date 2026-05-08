@@ -55,7 +55,10 @@ _PING_INTERVAL = 20  # seconds — matches aioesphomeapi default
 _HELLO_TIMEOUT = 10  # seconds
 _HANDSHAKE_TIMEOUT = 10  # seconds (noise handshake)
 _API_VERSION_MAJOR = 1
-_API_VERSION_MINOR = 10
+# Match the highest minor the server itself advertises (api_connection.cpp
+# HelloResponse). Going higher would claim feature-gate support that the
+# server doesn't actually have.
+_API_VERSION_MINOR = 14
 
 _NOISE_PROTOCOL = b"Noise_NNpsk0_25519_ChaChaPoly_SHA256"
 _NOISE_PROLOGUE_INIT = b"NoiseAPIInit"
