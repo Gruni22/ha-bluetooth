@@ -9,6 +9,7 @@ from typing import Any
 import voluptuous as vol
 
 from homeassistant import config_entries
+from homeassistant.config_entries import ConfigEntryDisabler
 from homeassistant.data_entry_flow import FlowResult
 
 from .const import (
@@ -100,6 +101,24 @@ def _list_serial_ports() -> list[tuple[str, str, int]]:
     return results
 
 
+def _conflicting_bluetooth_entries(hass: Any) -> list[Any]:
+    """Return enabled `bluetooth`-domain config entries.
+
+    `bless` needs exclusive control over the Pi's BT adapter via BlueZ. Any
+    enabled HA Bluetooth integration entry holding hci0 (or any local adapter)
+    will fight us — peripheral mode + active scan from the same process is
+    not something the BlueZ stack handles cleanly. We list these so the user
+    can decide whether to disable them.
+    """
+    try:
+        return [
+            e for e in hass.config_entries.async_entries("bluetooth")
+            if e.disabled_by is None
+        ]
+    except Exception:  # noqa: BLE001
+        return []
+
+
 def _list_esphome_devices(hass: Any) -> list[tuple[str, int, str, str]]:
     """Return [(host, port, label, noise_psk)] for ESPHome integrations already configured in HA.
 
@@ -155,7 +174,7 @@ class BluetoothApiConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 return await self.async_step_esp32()
             if self._adapter_mode == ADAPTER_MODE_ESPHOME:
                 return await self.async_step_esphome()
-            return self._finish()
+            return await self.async_step_native_warn()
 
         schema = vol.Schema(
             {
@@ -163,7 +182,7 @@ class BluetoothApiConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     {
                         ADAPTER_MODE_ESP32: "ESP32-S3 (USB-Serial Gateway)",
                         ADAPTER_MODE_ESPHOME: "ESPHome (ble_server über WLAN/native API)",
-                        ADAPTER_MODE_NATIVE: "Raspberry Pi Bluetooth (geplant)",
+                        ADAPTER_MODE_NATIVE: "Raspberry Pi Bluetooth (native, bless)",
                     }
                 ),
                 vol.Optional(CONF_DEVICE_NAME, default=CONF_DEVICE_NAME_DEFAULT): str,
@@ -256,6 +275,45 @@ class BluetoothApiConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             }
         )
         return self.async_show_form(step_id="esphome_manual", data_schema=schema)
+
+    async def async_step_native_warn(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """Native-mode pre-flight: warn about conflicts with HA's Bluetooth integration.
+
+        bless drives the Pi BT adapter as a peripheral via BlueZ/D-Bus. Any
+        already-running HA Bluetooth integration entry that's actively scanning
+        or holding the same adapter will stop our GATT server from advertising
+        / accepting connections cleanly. We list those entries and let the
+        user disable them in one click. Skipped entirely if no conflicts.
+        """
+        conflicts = _conflicting_bluetooth_entries(self.hass)
+
+        if user_input is not None:
+            if user_input.get("disable_conflicts") and conflicts:
+                for entry in conflicts:
+                    try:
+                        await self.hass.config_entries.async_set_disabled_by(
+                            entry.entry_id, ConfigEntryDisabler.USER
+                        )
+                    except Exception:  # noqa: BLE001
+                        # Non-fatal: setup proceeds, user can disable manually.
+                        pass
+            return self._finish()
+
+        if not conflicts:
+            # Nothing to warn about — straight to entry creation.
+            return self._finish()
+
+        conflict_list = "\n".join(
+            f"- **{e.title or e.domain}** ({e.entry_id[:8]}…)" for e in conflicts
+        )
+        schema = vol.Schema({vol.Optional("disable_conflicts", default=True): bool})
+        return self.async_show_form(
+            step_id="native_warn",
+            data_schema=schema,
+            description_placeholders={"conflicts": conflict_list},
+        )
 
     def _finish(self) -> FlowResult:
         """Create the config entry — no extra confirmation step.

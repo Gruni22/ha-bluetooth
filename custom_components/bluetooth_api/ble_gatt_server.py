@@ -13,7 +13,10 @@ import asyncio
 import logging
 from collections.abc import Callable
 
+from homeassistant.core import HomeAssistant
+
 from .const import BLE_RX_UUID, BLE_SERVICE_UUID, BLE_TX_UUID
+from .dispatcher import PacketDispatcher
 from .protocol import BLE_CHUNK_CONTINUES, BLE_CHUNK_FINAL, BLE_MAX_PAYLOAD
 
 _LOGGER = logging.getLogger(__name__)
@@ -265,7 +268,7 @@ class HaBleGattServer:
             # Detect client disconnect: previously had connected devices, now none
             if prev_connected and not connected_macs and self._connected:
                 _LOGGER.info("BLE: client disconnected (detected via bluetoothctl)")
-                self._connected = False
+                self._mark_disconnected()
 
             prev_connected = connected_macs
 
@@ -288,10 +291,36 @@ class HaBleGattServer:
                 if not result and self._connected:
                     # No subscribers — client disconnected
                     _LOGGER.info("BLE: client disconnected (no subscribers)")
-                    self._connected = False
+                    self._mark_disconnected()
                 await asyncio.sleep(0.02)  # 20 ms between chunks (> 15 ms connection interval)
             except Exception as exc:  # noqa: BLE001
                 _LOGGER.exception("BLE TX error: %s", exc)
+
+    def _mark_disconnected(self) -> None:
+        """Flip the connected flag *and* fire the on_disconnect callback.
+
+        Both code paths that detect a drop (no-subscriber TX failure, BlueZ
+        polling) used to only flip `_connected` — leaving the upstream
+        dispatcher subscribed to state-changes for a phantom client.
+        """
+        if not self._connected:
+            return
+        self._connected = False
+        # Drain any pending TX so the next client doesn't get bytes for the
+        # previous one's last in-flight request.
+        try:
+            while True:
+                self._tx_queue.get_nowait()
+        except asyncio.QueueEmpty:
+            pass
+        loop = getattr(self, "_loop", None)
+        if loop is not None:
+            loop.call_soon_threadsafe(self._on_disconnect)
+        else:
+            try:
+                self._on_disconnect()
+            except Exception:  # noqa: BLE001
+                _LOGGER.debug("BLE: on_disconnect callback raised", exc_info=True)
 
     def _handle_read(self, characteristic: object, **kwargs: object) -> bytearray:  # noqa: ARG002
         return bytearray()
@@ -332,3 +361,52 @@ def _encode_chunks(data: bytes) -> list[bytes]:
         chunks.append(bytes([flag]) + data[offset:end])
         offset = end
     return chunks
+
+
+# ── NativeBleServer ──────────────────────────────────────────────────────────
+
+
+class NativeBleServer(PacketDispatcher):
+    """Native Pi BT bridge: wraps `HaBleGattServer` to fit the dispatcher pattern.
+
+    Same shape as `EsphomeApiServer` and `UsbSerialServer` — the integration
+    `__init__.py` calls `start()` / `stop()`, the dispatcher protocol layer
+    talks application packets, this class handles BLE chunking + GATT.
+    """
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        device_name: str,
+        passcode: int = 0,
+        adapter: str | None = None,
+    ) -> None:
+        super().__init__(hass, passcode)
+        self._gatt = HaBleGattServer(
+            device_name=device_name,
+            adapter=adapter,
+            on_frame=self._on_frame_from_gatt,
+            on_connect=self._on_ble_client_connected,
+            on_disconnect=self._on_ble_client_disconnected,
+        )
+
+    async def start(self) -> None:
+        await self._gatt.start()
+        _LOGGER.info("Native BLE GATT server starting (%s)", self._gatt._device_name)
+
+    async def stop(self) -> None:
+        # Tell the dispatcher first so its state-change subscription is torn
+        # down before bless rips out the GATT stack underneath us.
+        self._on_ble_client_disconnected()
+        await self._gatt.stop()
+
+    async def _send_raw(self, data: bytes) -> None:
+        # `send_frame` enqueues; the GATT TX worker drains with built-in
+        # 20 ms throttling, same flow-control story as the ESPHome path.
+        await self._gatt.send_frame(data)
+
+    def _on_frame_from_gatt(self, frame: bytes) -> None:
+        # `HaBleGattServer` invokes this on the HA loop (via
+        # call_soon_threadsafe). We're sync here but the dispatcher's
+        # incoming-packet handler is async, so schedule it.
+        asyncio.ensure_future(self._handle_incoming_packet(frame))

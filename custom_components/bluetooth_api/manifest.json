@@ -12,7 +12,8 @@
     "pyserial-asyncio-fast==0.12",
     "qrcode>=7.4",
     "Pillow>=9.0",
-    "aioesphomeapi>=20"
+    "aioesphomeapi>=20",
+    "bless>=0.2.6"
   ],
   "version": "0.3.0"
 }

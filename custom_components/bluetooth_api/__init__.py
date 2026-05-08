@@ -87,13 +87,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     passcode: int = entry.data.get(CONF_PASSCODE, 0)
 
     if adapter_mode == ADAPTER_MODE_NATIVE:
-        _LOGGER.error(
-            "Native Pi Bluetooth adapter mode is selected but not yet implemented. "
-            "Please re-configure the integration with ESP32 or ESPHome mode."
-        )
-        return False
+        from .ble_gatt_server import NativeBleServer
 
-    if adapter_mode == ADAPTER_MODE_ESPHOME:
+        device_name: str = entry.data.get(CONF_DEVICE_NAME, CONF_DEVICE_NAME_DEFAULT)
+        server = NativeBleServer(hass, device_name=device_name, passcode=passcode)
+        try:
+            await server.start()
+            _LOGGER.info("Bluetooth API native BT server started as '%s'", device_name)
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.error("Failed to start native BT server '%s': %s", device_name, exc)
+        hass.data[DOMAIN][entry.entry_id] = [server]
+    elif adapter_mode == ADAPTER_MODE_ESPHOME:
         from .esphome_server import EsphomeApiServer
 
         host: str = entry.data.get(CONF_ESPHOME_HOST, "")

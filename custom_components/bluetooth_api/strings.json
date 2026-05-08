@@ -39,6 +39,13 @@
       "confirm": {
         "title": "Confirm setup",
         "description": "{info}"
+      },
+      "native_warn": {
+        "title": "Native Bluetooth — adapter conflict check",
+        "description": "Native mode runs a BLE GATT peripheral on the Pi's Bluetooth adapter via BlueZ/D-Bus. It needs exclusive use of the adapter — Home Assistant's Bluetooth integration (active scanning, ESPHome BLE-proxy, etc.) cannot run on the same adapter at the same time.\n\nThe following Bluetooth integrations are currently active and will likely conflict:\n\n{conflicts}\n\nCheck the box to disable them now. They stay configured (just disabled) and you can re-enable them any time from Settings → Devices & Services.",
+        "data": {
+          "disable_conflicts": "Disable the conflicting Bluetooth integrations"
+        }
       }
     },
     "abort": {
