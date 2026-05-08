@@ -26,6 +26,7 @@ OnConnectCallback = Callable[[], None]
 OnDisconnectCallback = Callable[[], None]
 
 _CHUNK_SIZE = 244  # BLE_MAX_CHUNK from ESP32 firmware (MTU 247 – 3 ATT header)
+_LEAK_NOTIFICATION_ID = "bluetooth_api_bluez_leak"
 
 
 class HaBleGattServer:
@@ -56,6 +57,13 @@ class HaBleGattServer:
         self._task: asyncio.Task | None = None
         # Queue for outgoing chunks to avoid concurrent writes
         self._tx_queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=256)
+        # Populated by _configure_via_dbus after the adapter is read. List of
+        # BlueZ-registered service UUIDs that are likely to trigger pairing on
+        # Android (LE-Audio, HID, A2DP/HSP/HFP, etc.). Empty = clean adapter.
+        self.leaking_uuids: list[str] = []
+        # Set after _configure_adapter() returns. NativeBleServer awaits this
+        # before reading `leaking_uuids` so the check sees post-config state.
+        self.configure_done: asyncio.Event = asyncio.Event()
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -189,10 +197,15 @@ class HaBleGattServer:
         Result: link layer unencrypted, no Pi-side bond, authentication lives
         one layer up in the 32-bit passcode each packet carries.
         """
-        ok = await self._configure_via_dbus()
-        if not ok:
-            _LOGGER.warning("BLE: D-Bus path failed, falling back to bluetoothctl")
-            await self._configure_via_bluetoothctl()
+        try:
+            ok = await self._configure_via_dbus()
+            if not ok:
+                _LOGGER.warning("BLE: D-Bus path failed, falling back to bluetoothctl")
+                await self._configure_via_bluetoothctl()
+        finally:
+            # Signal NativeBleServer that the adapter check is done, regardless
+            # of which path ran. Without this it would block forever waiting.
+            self.configure_done.set()
 
     async def _configure_via_dbus(self) -> bool:
         """Set Pairable=false, Discoverable=true, and clear LTK cache via D-Bus.
@@ -234,6 +247,21 @@ class HaBleGattServer:
                 "BLE: D-Bus set Pairable=false, Discoverable=true on %s",
                 adapter_path,
             )
+
+            # Inspect what UUIDs BlueZ has loaded on this adapter. Anything
+            # that triggers Android-side authentication during GATT discovery
+            # gets flagged so NativeBleServer can warn the user.
+            try:
+                uuids_v = await adapter_props.call_get("org.bluez.Adapter1", "UUIDs")
+                self.leaking_uuids = _classify_leaking_uuids(uuids_v.value)
+                if self.leaking_uuids:
+                    _LOGGER.warning(
+                        "BLE: BlueZ adapter exposes %d service(s) likely to trigger Android pairing: %s",
+                        len(self.leaking_uuids),
+                        ", ".join(self.leaking_uuids),
+                    )
+            except Exception as exc:  # noqa: BLE001
+                _LOGGER.debug("BLE: could not read Adapter1.UUIDs: %s", exc)
 
             # ── Clear stale LTKs by removing every known disconnected device.
             adapter_iface = adapter_obj.get_interface("org.bluez.Adapter1")
@@ -421,6 +449,45 @@ class HaBleGattServer:
             loop.call_soon_threadsafe(self._on_frame, frame)
 
 
+# UUIDs whose services typically have at least one characteristic with the SMP
+# encryption-required flag set. When BlueZ has these registered (because the
+# `audio` / `input` plugins are loaded) Android walks them during GATT
+# discovery, sees the flag, and pops the pairing dialog — even though our own
+# service has no auth requirements. We can't unload these from a non-host
+# context (HAOS sandboxing), so we flag them so the user can fix it once on
+# the host. UUID strings are lower-case to match BlueZ's reporting.
+_LEAKING_UUID_TABLE: dict[str, str] = {
+    # Classic profiles (SDP) — present on the same controller and listed in
+    # bluetoothctl, also surface as device-class hints to Android.
+    "00001108-0000-1000-8000-00805f9b34fb": "Headset (HSP)",
+    "0000110a-0000-1000-8000-00805f9b34fb": "A2DP Audio Source",
+    "0000110b-0000-1000-8000-00805f9b34fb": "A2DP Audio Sink",
+    "0000110c-0000-1000-8000-00805f9b34fb": "AVRCP Target",
+    "0000110e-0000-1000-8000-00805f9b34fb": "AVRCP Controller",
+    "00001112-0000-1000-8000-00805f9b34fb": "Headset Audio Gateway",
+    "0000111e-0000-1000-8000-00805f9b34fb": "Hands-Free (HFP)",
+    "0000111f-0000-1000-8000-00805f9b34fb": "Hands-Free Audio Gateway",
+    "00001124-0000-1000-8000-00805f9b34fb": "HID over Bluetooth",
+    "00001200-0000-1000-8000-00805f9b34fb": "PnP Information (DI)",
+    # LE Audio / GATT — these *are* on the BLE side and the actual primary
+    # cause of pairing prompts during BLE GATT discovery.
+    "00001843-0000-1000-8000-00805f9b34fb": "Audio Input Control (LE)",
+    "00001844-0000-1000-8000-00805f9b34fb": "Volume Control (LE)",
+    "00001845-0000-1000-8000-00805f9b34fb": "Volume Offset Control (LE)",
+    "0000184d-0000-1000-8000-00805f9b34fb": "Microphone Control (LE)",
+    "0000184f-0000-1000-8000-00805f9b34fb": "Broadcast Audio Scan (LE)",
+}
+
+
+def _classify_leaking_uuids(adapter_uuids: list[str]) -> list[str]:
+    """Return human-readable names for UUIDs that match the leak table."""
+    return [
+        _LEAKING_UUID_TABLE[u.lower()]
+        for u in adapter_uuids
+        if u.lower() in _LEAKING_UUID_TABLE
+    ]
+
+
 def _encode_chunks(data: bytes) -> list[bytes]:
     """Split *data* into BLE chunks (flag byte + payload)."""
     chunks: list[bytes] = []
@@ -463,6 +530,57 @@ class NativeBleServer(PacketDispatcher):
     async def start(self) -> None:
         await self._gatt.start()
         _LOGGER.info("Native BLE GATT server starting (%s)", self._gatt._device_name)
+        # Don't block setup on the leak-check; spin it off so failed/slow
+        # D-Bus calls can't hold up the rest of the integration.
+        asyncio.ensure_future(self._post_leak_notification())
+
+    async def _post_leak_notification(self) -> None:
+        """Wait for the BlueZ adapter check, then notify the user if BlueZ has
+        loaded plugins (audio/HID/LE-Audio) that will pull Android into a
+        pairing dialog during GATT discovery.
+
+        We can't fix this from inside the HA Core container (HAOS sandbox), so
+        the notification carries the exact host-shell command the user needs
+        to run once over the HAOS host SSH (port 22222).
+        """
+        try:
+            await asyncio.wait_for(self._gatt.configure_done.wait(), timeout=20)
+        except asyncio.TimeoutError:
+            return
+        leaks = self._gatt.leaking_uuids
+        if not leaks:
+            # Already clean — clear any old notification from a previous run.
+            await self._hass.services.async_call(
+                "persistent_notification", "dismiss",
+                {"notification_id": _LEAK_NOTIFICATION_ID},
+                blocking=False,
+            )
+            return
+
+        bullet_list = "\n".join(f"- {name}" for name in leaks)
+        message = (
+            "Native BT mode is up, but BlueZ on this Pi has extra services "
+            "loaded that will trigger an Android pairing dialog during GATT "
+            "discovery:\n\n"
+            f"{bullet_list}\n\n"
+            "**Fix on the HAOS host (port 22222 SSH or HDMI console):**\n\n"
+            "```sh\n"
+            "sed -i '/^\\[General\\]$/a DisablePlugins = audio,input,sap' "
+            "/etc/bluetooth/main.conf\n"
+            "systemctl restart bluetooth\n"
+            "```\n\n"
+            "Reload the Bluetooth API integration afterwards. This "
+            "notification disappears automatically once the adapter is clean."
+        )
+        await self._hass.services.async_call(
+            "persistent_notification", "create",
+            {
+                "notification_id": _LEAK_NOTIFICATION_ID,
+                "title": "Bluetooth API: BlueZ plugin conflict",
+                "message": message,
+            },
+            blocking=False,
+        )
 
     async def stop(self) -> None:
         # Tell the dispatcher first so its state-change subscription is torn
