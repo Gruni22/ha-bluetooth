@@ -211,7 +211,7 @@ Each adapter mode wraps the same packet in its own outer frame:
 | Layer | Measure |
 |-------|---------|
 | BLE | **Open** — `setSecurityAuth(false, false, false)`. No bonding, no encryption. |
-| App | **Passcode** (32 bits) in every packet. The Pi rejects packets with the wrong passcode. |
+| App | **Passcode** (32 bits) in every packet. Home Assistant rejects packets with the wrong passcode. |
 | HA | Only locally callable API methods. No remote access. |
 
 **Threat model:** anyone within BLE range (~10 m) who learns the passcode can issue commands. The passcode is only displayed once as a QR code inside HA itself.
